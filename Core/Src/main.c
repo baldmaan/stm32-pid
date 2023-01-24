@@ -33,6 +33,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define COUNTOF(__BUFFER__) (sizeof(__BUFFER__) / (sizeof *(__BUFFER__)))
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -43,28 +44,82 @@
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
 
+TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim3;
 
 UART_HandleTypeDef huart2;
+DMA_HandleTypeDef hdma_usart2_rx;
 
 /* USER CODE BEGIN PV */
-float current_temp_f = 0.0f;
-int32_t pressure = 0;
-char* current_temp_ch_UART;
+float current_temp_f;
+char current_temp_ch_UART[29];
+
+float set_temp_f = 30.0;
+
+char set_temp_ch_UART[24];
+
+int32_t pressure;
+
+
+float pwm_duty_f;
+uint16_t pwm_duty_u = 0;
+
+char get_UART[10];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_TIM3_Init(void);
+static void MX_TIM1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+struct Controller{
+	float Kp;
+	float Ki;
+	float Kd;
+	float Tp;
+	float prev_error;
+	float prev_u_I;
+
+};
+
+
+float calculate_PID(struct Controller *PID, float set_temp, float meas_temp){
+	float u = 0;
+	float error;
+	float u_P, u_I , u_D;
+
+	error = set_temp - meas_temp;
+
+	// Proportional
+	u_P = PID->Kp * error;
+
+	// Integral
+	u_I = PID->Ki * PID->Tp / 2.0 * (error + PID->prev_error) + PID->prev_u_I;
+	PID->prev_u_I = u_I;
+
+	// Derivative
+	u_D = (error - PID->prev_error) / PID->Tp;
+
+	PID->prev_error = error;
+
+	// Sum of P, I and D components
+	u = u_P + u_I + u_D;
+
+	return u;
+}
+
+struct Controller PID;
+
+
 
 /* USER CODE END 0 */
 
@@ -96,25 +151,37 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_USART2_UART_Init();
   MX_I2C1_Init();
   MX_TIM3_Init();
+  MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
   BMP280_Init(&hi2c1, BMP280_TEMPERATURE_16BIT, BMP280_STANDARD, BMP280_FORCEDMODE);
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+  HAL_TIM_Base_Start_IT(&htim3);
+
+  PID.Kp = 0.03928;
+  PID.Ki = 0.0002692;
+  PID.Kd = 0.01957;
+  PID.Tp = 1;
+  PID.prev_error = 0;
+  PID.prev_u_I = 0;
+
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart2, (uint8_t *)get_UART, 10);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  BMP280_ReadTemperatureAndPressure(&current_temp_f, &pressure);
-	  HAL_Delay(500);
+
 
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-
+	  // Reset data from UART
+	  	  memset(get_UART, 0, 10);
   }
   /* USER CODE END 3 */
 }
@@ -192,6 +259,81 @@ static void MX_I2C1_Init(void)
 }
 
 /**
+  * @brief TIM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM1_Init(void)
+{
+
+  /* USER CODE BEGIN TIM1_Init 0 */
+
+  /* USER CODE END TIM1_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+
+  /* USER CODE BEGIN TIM1_Init 1 */
+
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 0;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 65535;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 0;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
+
+  /* USER CODE END TIM1_Init 2 */
+  HAL_TIM_MspPostInit(&htim1);
+
+}
+
+/**
   * @brief TIM3 Initialization Function
   * @param None
   * @retval None
@@ -205,7 +347,6 @@ static void MX_TIM3_Init(void)
 
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_OC_InitTypeDef sConfigOC = {0};
 
   /* USER CODE BEGIN TIM3_Init 1 */
 
@@ -225,28 +366,15 @@ static void MX_TIM3_Init(void)
   {
     Error_Handler();
   }
-  if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
-  {
-    Error_Handler();
-  }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
   if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
   {
     Error_Handler();
   }
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 500;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
-  {
-    Error_Handler();
-  }
   /* USER CODE BEGIN TIM3_Init 2 */
 
   /* USER CODE END TIM3_Init 2 */
-  HAL_TIM_MspPostInit(&htim3);
 
 }
 
@@ -280,6 +408,22 @@ static void MX_USART2_UART_Init(void)
   /* USER CODE BEGIN USART2_Init 2 */
 
   /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Channel6_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel6_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel6_IRQn);
 
 }
 
@@ -321,7 +465,40 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
+	if(htim->Instance == TIM3){
 
+		BMP280_ReadTemperatureAndPressure(&current_temp_f, &pressure);
+		sprintf(current_temp_ch_UART, "Current temperature: %.2f\n\r", current_temp_f);
+		HAL_UART_Transmit(&huart2, (uint8_t *)current_temp_ch_UART, sizeof(current_temp_ch_UART)-1, 1000);
+
+		sprintf((char*)set_temp_ch_UART, "Set temperature: %.2f\n\r", set_temp_f);
+		HAL_UART_Transmit(&huart2, (uint8_t*)set_temp_ch_UART, strlen(set_temp_ch_UART), 1000);
+
+		pwm_duty_f = (htim1.Init.Period * calculate_PID(&PID, set_temp_f, current_temp_f));
+
+		if(pwm_duty_f < 0.0) pwm_duty_u = 0;
+		else if(pwm_duty_f > htim1.Init.Period) pwm_duty_u = htim1.Init.Period;
+		else pwm_duty_u = (uint16_t) pwm_duty_f;
+
+
+		__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pwm_duty_u);
+
+	}
+
+}
+
+// UART callback handling
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size){
+	if(huart->Instance == USART2){
+		float tmp = atof(get_UART);
+		if(tmp < 20) set_temp_f = 20;
+		else if(tmp > 65) set_temp_f = 65;
+		else set_temp_f = tmp;
+
+		HAL_UARTEx_ReceiveToIdle_DMA(&huart2, (uint8_t *)get_UART, 10);
+	}
+}
 /* USER CODE END 4 */
 
 /**
